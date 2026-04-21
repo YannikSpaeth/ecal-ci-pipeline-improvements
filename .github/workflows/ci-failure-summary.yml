@@ -1,0 +1,68 @@
+name: CI Failure Summary
+
+on:
+  workflow_call:
+    inputs:
+      artifact_name:
+        description: "Name of artifact containing JUnit XML files"
+        required: false
+        type: string
+        default: test-results
+
+permissions:
+  contents: read
+
+jobs:
+  summarize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download test result artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: test-results
+
+      - name: Summarize JUnit failures
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import glob
+          import xml.etree.ElementTree as ET
+
+          files = glob.glob('test-results/**/*.xml', recursive=True)
+          total = passed = failed = 0
+          lines = []
+
+          for f in files:
+            try:
+              root = ET.parse(f).getroot()
+            except Exception:
+              continue
+
+            suites = [root] if root.tag == 'testsuite' else root.findall('.//testsuite')
+            for s in suites:
+              tests = int(s.attrib.get('tests', 0) or 0)
+              failures = int(s.attrib.get('failures', 0) or 0)
+              errors = int(s.attrib.get('errors', 0) or 0)
+              total += tests
+              failed += failures + errors
+              passed += max(tests - failures - errors, 0)
+
+          summary = [
+            '## Test Summary',
+            '',
+            f'- JUnit files found: {len(files)}',
+            f'- Total tests: {total}',
+            f'- Passed: {passed}',
+            f'- Failed/Error: {failed}',
+          ]
+
+          out = os.environ.get('GITHUB_STEP_SUMMARY')
+          if out:
+            with open(out, 'a', encoding='utf-8') as fh:
+              fh.write('\n'.join(summary) + '\n')
+
+          if failed > 0:
+            raise SystemExit(1)
+          PY
