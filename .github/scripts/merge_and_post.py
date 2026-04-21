@@ -29,9 +29,9 @@ def extract_gtest_failure(system_out, test_name):
 
 
 def extract_all_gtest_failures(system_out):
-    """Fallback parser for CTest-wrapped GTest logs where testcase names don't match JUnit case names.
+    """Fallback parser for CTest-wrapped GTest logs where JUnit case names are coarse (e.g. test_core).
 
-    Captures all failed GTest blocks from system_out so messages aren't empty.
+    Returns a list of (failed_test_name, failure_body) tuples extracted from [ RUN ] ... [ FAILED ] blocks.
     """
     current_test = None
     current_lines = []
@@ -50,7 +50,7 @@ def extract_all_gtest_failures(system_out):
             if current_test and failed_test == current_test:
                 body = "\n".join([l for l in current_lines if l.strip()]).strip()
                 if body:
-                    failed_blocks.append(body)
+                    failed_blocks.append((failed_test, body))
             current_test = None
             current_lines = []
             continue
@@ -58,7 +58,7 @@ def extract_all_gtest_failures(system_out):
         if current_test is not None:
             current_lines.append(line)
 
-    return "\n\n".join(failed_blocks).strip()
+    return failed_blocks
 
 
 def build_source_link(failure_text, repo, sha):
@@ -85,26 +85,34 @@ def build_source_link(failure_text, repo, sha):
 
 def parse_xml_file(xml_path, platform, repo, sha):
     """Parse a CTest JUnit XML file and return (failures, passed_count, total_count)."""
-    failures, passed = [], 0
+    failures, passed, total_cases = [], 0, 0
     for suite in JUnitXml.fromfile(xml_path):
         for case in suite:
+            total_cases += 1
             if case.result and isinstance(case.result[0], (Failure, Error)):
-                body = extract_gtest_failure(case.system_out, case.name)
-                if not body:
-                    body = extract_all_gtest_failures(case.system_out)
-                if not body:
-                    body = str(case.result[0]) if case.result else "No failure details found"
+                detailed_failures = []
 
-                link_text, link_url = build_source_link(body, repo, sha)
-                failures.append({
-                    "name":      f"{suite.name}.{case.name}",
-                    "link_text": link_text,
-                    "link_url":  link_url,
-                    "message":   body.strip(),
-                })
+                exact_body = extract_gtest_failure(case.system_out, case.name)
+                if exact_body:
+                    detailed_failures.append((case.name, exact_body.strip()))
+                else:
+                    detailed_failures.extend(extract_all_gtest_failures(case.system_out))
+
+                if not detailed_failures:
+                    fallback_body = str(case.result[0]) if case.result else "No failure details found"
+                    detailed_failures.append((case.name, fallback_body.strip()))
+
+                for failed_name, body in detailed_failures:
+                    link_text, link_url = build_source_link(body, repo, sha)
+                    failures.append({
+                        "name":      failed_name,
+                        "link_text": link_text,
+                        "link_url":  link_url,
+                        "message":   body,
+                    })
             else:
                 passed += 1
-    return failures, passed, passed + len(failures)
+    return failures, passed, total_cases
 
 
 def load_all_results(xml_dir, repo, sha):
