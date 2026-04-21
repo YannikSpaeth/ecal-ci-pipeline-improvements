@@ -1,11 +1,9 @@
-# eCAL CI Failure Summary (Reusable Workflow)
+# CI Failure Summary (Reusable Workflow)
 
 Reusable GitHub workflow to summarize CTest/GTest JUnit failures across artifacts and publish:
 
 - GitHub Step Summary
 - one marker-based PR comment (updated, not duplicated)
-
-Repository: `YannikSpaeth/ecal-ci-pipeline-improvements`
 
 ---
 
@@ -51,7 +49,7 @@ report-tests:
   permissions:
     contents: read
     pull-requests: write
-  uses: YannikSpaeth/ecal-ci-pipeline-improvements/.github/workflows/ci-failure-summary.yml@main
+  uses: <OWNER>/<REPO>/.github/workflows/ci-failure-summary.yml@main
   with:
     artifact_name: test-results-*
     pr_number: ${{ github.event.pull_request.number }}

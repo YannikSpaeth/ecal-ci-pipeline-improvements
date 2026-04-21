@@ -34,11 +34,22 @@ jobs:
           path: test-results
           merge-multiple: true
 
+      - name: Resolve reusable workflow source
+        id: reusable_source
+        shell: bash
+        run: |
+          WORKFLOW_REF='${{ github.workflow_ref }}'
+          REPO="${WORKFLOW_REF%%/.github/workflows/*}"
+          REF="${WORKFLOW_REF##*@}"
+
+          echo "repository=$REPO" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
       - name: Checkout reusable workflow scripts
         uses: actions/checkout@v4
         with:
-          repository: YannikSpaeth/ecal-ci-pipeline-improvements
-          ref: main
+          repository: ${{ steps.reusable_source.outputs.repository }}
+          ref: ${{ steps.reusable_source.outputs.ref }}
           path: _reusable
           sparse-checkout: |
             .github/scripts
