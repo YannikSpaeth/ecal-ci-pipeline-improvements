@@ -34,6 +34,15 @@ jobs:
           path: test-results
           merge-multiple: true
 
+      - name: Checkout reusable workflow scripts
+        uses: actions/checkout@v4
+        with:
+          repository: YannikSpaeth/ecal-ci-pipeline-improvements
+          ref: main
+          path: _reusable
+          sparse-checkout: |
+            .github/scripts
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -65,7 +74,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python .github/scripts/merge_and_post.py \
+          python _reusable/.github/scripts/merge_and_post.py \
             --xml-dir test-results \
             --repo "${{ github.repository }}" \
             --run-id "${{ github.run_id }}" \
