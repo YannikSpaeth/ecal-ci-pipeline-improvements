@@ -15,7 +15,7 @@ WORKSPACE = os.environ.get("GITHUB_WORKSPACE",  "").rstrip("/")
 
 
 def extract_gtest_failure(system_out, test_name):
-    """Extract the assertion lines between [ RUN ] and [ FAILED ] from GTest's system_out."""
+    """Extract assertion lines between [ RUN ] and [ FAILED ] for an exact test name match."""
     capturing, captured_lines = False, []
     for line in (system_out or "").splitlines():
         if f"[ RUN      ] {test_name}" in line:
@@ -28,16 +28,57 @@ def extract_gtest_failure(system_out, test_name):
     return "\n".join(captured_lines).strip()
 
 
+def extract_all_gtest_failures(system_out):
+    """Fallback parser for CTest-wrapped GTest logs where testcase names don't match JUnit case names.
+
+    Captures all failed GTest blocks from system_out so messages aren't empty.
+    """
+    current_test = None
+    current_lines = []
+    failed_blocks = []
+
+    for line in (system_out or "").splitlines():
+        run_match = re.match(r"^\[\s*RUN\s*\]\s+(.+)$", line)
+        if run_match:
+            current_test = run_match.group(1).strip()
+            current_lines = []
+            continue
+
+        failed_match = re.match(r"^\[\s*FAILED\s*\]\s+(.+?)(?:\s+\(.*\))?$", line)
+        if failed_match:
+            failed_test = failed_match.group(1).strip()
+            if current_test and failed_test == current_test:
+                body = "\n".join([l for l in current_lines if l.strip()]).strip()
+                if body:
+                    failed_blocks.append(body)
+            current_test = None
+            current_lines = []
+            continue
+
+        if current_test is not None:
+            current_lines.append(line)
+
+    return "\n\n".join(failed_blocks).strip()
+
+
 def build_source_link(failure_text, repo, sha):
-    """Parse the file:line header from a GTest failure and return (display_text, url)."""
+    """Parse a file:line header from a GTest failure block and return (display_text, url)."""
     if not failure_text:
         return "", ""
-    match = re.match(r'^(.+?):(\d+):\s+\w+', failure_text.strip().splitlines()[0])
-    if not match:
+
+    path, line = "", ""
+    for raw in failure_text.strip().splitlines():
+        match = re.match(r'^(.+?):(\d+):\s+\w+', raw.strip())
+        if match:
+            path, line = match.group(1), match.group(2)
+            break
+
+    if not path:
         return "", ""
-    path, line = match.group(1), match.group(2)
+
     if WORKSPACE and path.startswith(WORKSPACE):
         path = path[len(WORKSPACE):].lstrip("/")
+
     url = f"{SERVER}/{repo}/blob/{sha}/{path}#L{line}" if repo else ""
     return f"{path}:{line}", url
 
@@ -48,14 +89,18 @@ def parse_xml_file(xml_path, platform, repo, sha):
     for suite in JUnitXml.fromfile(xml_path):
         for case in suite:
             if case.result and isinstance(case.result[0], (Failure, Error)):
-                body  = extract_gtest_failure(case.system_out, case.name)
-                lines = body.splitlines()
+                body = extract_gtest_failure(case.system_out, case.name)
+                if not body:
+                    body = extract_all_gtest_failures(case.system_out)
+                if not body:
+                    body = str(case.result[0]) if case.result else "No failure details found"
+
                 link_text, link_url = build_source_link(body, repo, sha)
                 failures.append({
                     "name":      f"{suite.name}.{case.name}",
                     "link_text": link_text,
                     "link_url":  link_url,
-                    "message":   "\n".join(lines[1:]).strip() if len(lines) > 1 else body,
+                    "message":   body.strip(),
                 })
             else:
                 passed += 1
@@ -71,8 +116,14 @@ def load_all_results(xml_dir, repo, sha):
 
     results = []
     for xml_path in xml_files:
-        parent   = os.path.basename(os.path.dirname(xml_path))
-        platform = parent.replace("test-results-", "") or os.path.splitext(os.path.basename(xml_path))[0]
+        parent = os.path.basename(os.path.dirname(xml_path))
+        stem   = os.path.splitext(os.path.basename(xml_path))[0]
+
+        if parent.startswith("test-results-") and parent != "test-results":
+            platform = parent.replace("test-results-", "", 1)
+        else:
+            platform = stem.replace("test-results-", "", 1) if stem.startswith("test-results-") else stem
+
         print(f"Parsing '{xml_path}' (platform: {platform}) ...")
         failures, passed, total = parse_xml_file(xml_path, platform, repo, sha)
         print(f"  -> {passed}/{total} passed, {len(failures)} failed")
