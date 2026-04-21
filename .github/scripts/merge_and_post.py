@@ -83,7 +83,121 @@ def build_source_link(failure_text, repo, sha):
     return f"{path}:{line}", url
 
 
-def parse_xml_file(xml_path, platform, repo, sha):
+def fetch_run_job_metadata(repo, run_id, token):
+    """Return mapping platform -> metadata for build jobs in a workflow run."""
+    if not (repo and run_id and token):
+        return {}
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    jobs = []
+    page = 1
+    while True:
+        response = requests.get(
+            f"{API}/repos/{repo}/actions/runs/{run_id}/jobs",
+            headers=headers,
+            params={"per_page": 100, "page": page},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        page_jobs = payload.get("jobs", [])
+        jobs.extend(page_jobs)
+        if len(page_jobs) < 100:
+            break
+        page += 1
+
+    result = {}
+    for job in jobs:
+        name = job.get("name", "")
+        m = re.match(r"^build-ubuntu \((.+)\)$", name)
+        if not m:
+            continue
+
+        platform = m.group(1).strip()
+        run_tests_step = 1
+        for step in job.get("steps", []):
+            if step.get("name") == "Run Tests":
+                run_tests_step = step.get("number", 1)
+                break
+
+        result[platform] = {
+            "job_id": job.get("id") or job.get("databaseId"),
+            "html_url": job.get("html_url") or job.get("url", ""),
+            "run_tests_step": run_tests_step,
+            "_log_lines": None,
+        }
+
+    return result
+
+
+def fetch_job_log_lines(repo, job_id, token):
+    if not (repo and job_id and token):
+        return []
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = requests.get(f"{API}/repos/{repo}/actions/jobs/{job_id}/logs", headers=headers)
+    response.raise_for_status()
+    return response.text.splitlines()
+
+
+def build_log_link(platform, failed_test_name, failure_text, repo, token, run_jobs):
+    """Build a link to Run Tests log step and approximate line where the test starts."""
+    if not run_jobs or platform not in run_jobs:
+        return "", ""
+
+    meta = run_jobs[platform]
+    if not meta.get("html_url"):
+        return "", ""
+
+    if meta.get("_log_lines") is None:
+        meta["_log_lines"] = fetch_job_log_lines(repo, meta.get("job_id"), token)
+
+    log_lines = meta.get("_log_lines") or []
+
+    needle = f"[ RUN      ] {failed_test_name}"
+    line_no = None
+    for idx, line in enumerate(log_lines, start=1):
+        if needle in line:
+            line_no = idx
+            break
+
+    if line_no is None:
+        short_name = failed_test_name.split(".")[-1]
+        for idx, line in enumerate(log_lines, start=1):
+            if f"[ RUN      ]" in line and short_name in line:
+                line_no = idx
+                break
+
+    if line_no is None:
+        first_source = ""
+        for raw in (failure_text or "").splitlines():
+            m = re.match(r'^(.+?):(\d+):\s+\w+', raw.strip())
+            if m:
+                first_source = raw.strip()
+                break
+        if first_source:
+            for idx, line in enumerate(log_lines, start=1):
+                if first_source in line:
+                    line_no = idx
+                    break
+
+    if line_no is None:
+        line_no = 1
+
+    step_no = meta.get("run_tests_step", 1)
+    url = f"{meta['html_url']}#step:{step_no}:{line_no}"
+    return f"Run Tests log (line {line_no})", url
+
+
+def parse_xml_file(xml_path, platform, repo, sha, token, run_jobs):
     """Parse a CTest JUnit XML file and return (failures, passed_count, total_count)."""
     failures, passed, total_cases = [], 0, 0
     for suite in JUnitXml.fromfile(xml_path):
@@ -104,18 +218,21 @@ def parse_xml_file(xml_path, platform, repo, sha):
 
                 for failed_name, body in detailed_failures:
                     link_text, link_url = build_source_link(body, repo, sha)
+                    log_link_text, log_link_url = build_log_link(platform, failed_name, body, repo, token, run_jobs)
                     failures.append({
-                        "name":      failed_name,
-                        "link_text": link_text,
-                        "link_url":  link_url,
-                        "message":   body,
+                        "name":           failed_name,
+                        "link_text":      link_text,
+                        "link_url":       link_url,
+                        "log_link_text":  log_link_text,
+                        "log_link_url":   log_link_url,
+                        "message":        body,
                     })
             else:
                 passed += 1
     return failures, passed, total_cases
 
 
-def load_all_results(xml_dir, repo, sha):
+def load_all_results(xml_dir, repo, sha, token, run_jobs):
     """Find all XML files under xml_dir and parse them, returning a list of result dicts."""
     xml_files = sorted(glob.glob(os.path.join(xml_dir, "**", "*.xml"), recursive=True))
     if not xml_files:
@@ -133,7 +250,7 @@ def load_all_results(xml_dir, repo, sha):
             platform = stem.replace("test-results-", "", 1) if stem.startswith("test-results-") else stem
 
         print(f"Parsing '{xml_path}' (platform: {platform}) ...")
-        failures, passed, total = parse_xml_file(xml_path, platform, repo, sha)
+        failures, passed, total = parse_xml_file(xml_path, platform, repo, sha, token, run_jobs)
         print(f"  -> {passed}/{total} passed, {len(failures)} failed")
         results.append({"platform": platform, "failures": failures, "passed": passed, "total": total})
     return results
@@ -209,8 +326,12 @@ def main():
     parser.add_argument("--sha",       default="HEAD")
     args = parser.parse_args()
 
-    run_url      = f"{SERVER}/{args.repo}/actions/runs/{args.run_id}" if args.repo and args.run_id else ""
-    results      = load_all_results(args.xml_dir, args.repo, args.sha)
+    run_url = f"{SERVER}/{args.repo}/actions/runs/{args.run_id}" if args.repo and args.run_id else ""
+
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    run_jobs = fetch_run_job_metadata(args.repo, args.run_id, token) if token else {}
+
+    results = load_all_results(args.xml_dir, args.repo, args.sha, token, run_jobs)
     comment_body = render_comment(results, run_url, args.sha)
 
     write_step_summary(comment_body)
